@@ -1,0 +1,16 @@
+# Copy to /etc/systemd/system/cafeteria.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cafeteria
+# Change User and the paths if your username or folder differ.
+[Unit]
+Description=cafeteria scanner
+After=network.target
+
+[Service]
+User=aaditya
+WorkingDirectory=/home/aaditya/cafeteria
+ExecStart=/home/aaditya/cafeteria/venv/bin/python -u /home/aaditya/cafeteria/cafeteria.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

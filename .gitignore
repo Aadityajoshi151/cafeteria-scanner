@@ -1,0 +1,19 @@
+settings.ini
+employees.csv
+*.db
+*.db-journal
+output/
+*.xlsx
+
+# --- Python ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# --- Editors and OS ---
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
