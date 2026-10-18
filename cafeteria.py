@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-cafeteria scanner - prototype v2
+Cafeteria scanner - prototype v2
 Reader + Veg/Non-Veg/Complete buttons + buzzer + OLED + local storage + Excel export
 + email on Complete (settings in settings.ini).
 """
 
 import configparser
 import csv
+import math
 import os
 import queue
+import signal
 import smtplib
 import sqlite3
 import subprocess
@@ -33,7 +35,7 @@ from PIL import ImageFont
 # ---------------- Settings (these will move to a config file later) ----------------
 BASE_DIR = Path(__file__).resolve().parent
 EMPLOYEES_CSV = BASE_DIR / "employees.csv"   # columns: card_id,emp_id,name
-DB_PATH = BASE_DIR / "cafeteria.db"
+DB_PATH = BASE_DIR / "canteen.db"
 OUTPUT_DIR = BASE_DIR / "output"
 SETTINGS_INI = BASE_DIR / "settings.ini"     # email settings (read each time Complete is pressed)
 
@@ -46,6 +48,10 @@ MESSAGE_TIME = 3      # seconds a result message stays on screen
 REPEAT_IGNORE = 2     # ignore the same card for this long (module repeats while a card is held)
 QUIT_KEY = "0"        # press this key in the terminal to stop the script
 IDLE_REFRESH = 5      # seconds between idle-screen updates (date, counts, clock warning)
+SHUTDOWN_HOLD = 5     # hold COMPLETE this long to shut the device down
+SHORT_PRESS = 1.0     # COMPLETE released within this many seconds = normal press (export + email);
+                      # released between this and SHUTDOWN_HOLD = cancelled, nothing happens
+SHUTDOWN_CMD = ["sudo", "-n", "systemctl", "poweroff"]   # -n: fail instead of asking for a password
 CLOCK_WARNING = True  # show "Clock not set" until the time is synced from the internet
                       # (set to False once an RTC module keeps the time without network)
 
@@ -367,7 +373,7 @@ def cleanup():
         lambda: RESOURCES["buzzer"].off(),
         lambda: [b.close() for b in RESOURCES["buttons"]],
         lambda: RESOURCES["buzzer"].close(),
-        lambda: RESOURCES["device"].cleanup(),      # blanks the OLED
+        lambda: RESOURCES["device"].cleanup(),      # blanks the OLED (unless persist is set)
         lambda: RESOURCES["db"].close(),
     ]
     for step in steps:
@@ -407,11 +413,38 @@ def main():
     buttons = {
         VEG: Button(PIN_VEG, bounce_time=0.05),
         NONVEG: Button(PIN_NONVEG, bounce_time=0.05),
-        COMPLETE: Button(PIN_COMPLETE, bounce_time=0.05),
+        COMPLETE: Button(PIN_COMPLETE, bounce_time=0.05, hold_time=SHUTDOWN_HOLD),
     }
-    for name, btn in buttons.items():
-        btn.when_pressed = lambda n=name: events.put(("button", n))
+    for name in (VEG, NONVEG):
+        buttons[name].when_pressed = lambda n=name: events.put(("button", n))
+
+    # COMPLETE acts on release, so holding it for shutdown doesn't also send the email.
+    hold = {"since": None, "held": False}
+
+    def complete_pressed():
+        hold["since"], hold["held"] = time.monotonic(), False
+
+    def complete_held():                       # fires once, after SHUTDOWN_HOLD seconds
+        hold["held"] = True
+        events.put(("shutdown", None))
+
+    def complete_released():
+        since, hold["since"] = hold["since"], None
+        if hold["held"] or since is None:
+            return
+        if time.monotonic() - since < SHORT_PRESS:
+            events.put(("button", COMPLETE))
+        else:
+            events.put(("hold_cancelled", None))
+
+    buttons[COMPLETE].when_pressed = complete_pressed
+    buttons[COMPLETE].when_held = complete_held
+    buttons[COMPLETE].when_released = complete_released
     RESOURCES.update(device=device, buzzer=buzzer, db=db, buttons=list(buttons.values()))
+
+    # "systemctl stop" and system shutdown send SIGTERM: exit through the normal cleanup.
+    if threading.current_thread() is threading.main_thread():   # signals only work there
+        signal.signal(signal.SIGTERM, lambda *_: events.put(("quit", None)))
 
     threading.Thread(target=reader_thread, daemon=True).start()
 
@@ -419,6 +452,8 @@ def main():
     message_until = 0.0   # a result message stays on screen until this time
     sending = False       # True while an email is being sent in the background
     deferred = None       # email result to show once the current customer is done
+    countdown = None      # number currently shown in the shutdown countdown
+    shutdown_waiting = False   # shutdown requested while an email was still sending
 
     idle = {"shown": None, "at": 0.0}
 
@@ -437,6 +472,25 @@ def main():
         show(device, big, s1, s2)
         message_until = time.monotonic() + MESSAGE_TIME
 
+    def shut_down():
+        """Powers the device off. Returns only if the shutdown command failed."""
+        print("Shutting down")
+        show(device, "Shutting down", "Unplug when the", "green LED stops")
+        beep(buzzer, "timeout")
+        device.persist = True                  # keep this message on screen after power-off
+        try:
+            r = subprocess.run(SHUTDOWN_CMD, capture_output=True, text=True, timeout=15)
+            ok, err = r.returncode == 0, r.stderr.strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            ok, err = False, str(e)
+        if ok:
+            return True
+        print(f"Shutdown FAILED: {err}")
+        device.persist = False
+        message("Shutdown FAILED", "See log / sudo setup")
+        beep(buzzer, "error")
+        return False
+
     idle_screen()
     beep(buzzer, "ok")
     RESOURCES["terminal"] = start_quit_key()
@@ -451,6 +505,34 @@ def main():
 
         if kind == "quit":
             return
+
+        if kind == "shutdown":
+            countdown = None
+            if sending:                        # let the email finish first
+                shutdown_waiting = True
+                show(device, "Finishing email", "then shutting down", "Please wait")
+                message_until = time.monotonic() + 120
+            elif shut_down():
+                return
+            continue
+
+        if kind == "hold_cancelled":
+            countdown = None
+            message("Shutdown", "cancelled")
+            beep(buzzer, "twice")
+            print("Shutdown cancelled (COMPLETE released early)")
+            continue
+
+        # While COMPLETE is held past a short press, count down to shutdown.
+        since = hold["since"]
+        if since is not None and not hold["held"] and now - since >= SHORT_PRESS:
+            left = max(1, math.ceil(SHUTDOWN_HOLD - (now - since)))
+            if left != countdown:
+                countdown = left
+                pending = None
+                show(device, "Keep holding", f"Shutdown in {left}", "Release to cancel")
+                message_until = now + 60       # stops the idle screen drawing over the countdown
+                beep(buzzer, "read")
 
         if kind == "card":
             emp = employees.lookup(value)
@@ -507,7 +589,13 @@ def main():
             screen = ("Email sent", "File delivered", "") if ok else \
                      ("Email FAILED", reason, "Press COMPLETE again")
             beep(buzzer, "twice" if ok else "error")
-            if pending is None:
+            if shutdown_waiting:
+                shutdown_waiting = False
+                message(*screen)
+                time.sleep(MESSAGE_TIME)           # let the vendor see the email result
+                if shut_down():
+                    return
+            elif pending is None:
                 message(*screen)
             else:
                 deferred = screen                  # don't hide someone's Veg/Non-Veg prompt
