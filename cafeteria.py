@@ -24,7 +24,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 import serial
-from gpiozero import Button, Buzzer
+from gpiozero import LED, Button, Buzzer
 from luma.core.interface.serial import spi
 from luma.core.render import canvas
 from luma.oled.device import ssd1306
@@ -42,6 +42,7 @@ SETTINGS_INI = BASE_DIR / "settings.ini"     # email settings (read each time Co
 SERIAL_PORT = "/dev/serial0"
 PIN_VEG, PIN_NONVEG, PIN_COMPLETE, PIN_BUZZER = 17, 27, 22, 18
 OLED_DC, OLED_RST = 24, 25
+LED_RED, LED_GREEN = 19, 26       # bicolor LED (pins 35 and 37), common cathode to GND
 
 CHOICE_TIMEOUT = 10   # seconds to press Veg/Non-Veg after tapping a card
 MESSAGE_TIME = 3      # seconds a result message stays on screen
@@ -329,9 +330,75 @@ BEEPS = {                 # (on seconds, off seconds, count)
 }
 
 
-def beep(buzzer, kind):
+FLASH_FOR_BEEP = {"ok": "ok", "twice": "ok", "error": "error", "timeout": "error"}
+
+
+def beep(buzzer, kind, flash=True):
     on, off, n = BEEPS[kind]
     buzzer.beep(on_time=on, off_time=off, n=n, background=True)
+    led = RESOURCES.get("led")
+    if flash and led and kind in FLASH_FOR_BEEP:
+        led.flash(FLASH_FOR_BEEP[kind])        # every beep has a matching LED flash
+
+
+# ---------------- Status LED (red/green, common cathode) ----------------
+class StatusLED:
+    """Runs blink patterns in a background thread.
+    set(mode) picks the steady pattern; flash(kind) plays a short pattern once, then returns to it."""
+
+    # Each pattern is a list of (red, green, seconds) steps, looped.
+    MODES = {
+        "ready":   [(0, 1, 1.0)],                       # green steady
+        "waiting": [(0, 1, 0.3), (0, 0, 0.3)],          # green blinking
+        "busy":    [(1, 0, 0.3), (0, 1, 0.3)],          # red/green alternating
+        "noclock": [(1, 0, 0.5), (0, 0, 1.5)],          # red slow blink
+        "halt":    [(1, 0, 1.0)],                       # red steady (shutting down)
+        "off":     [(0, 0, 1.0)],
+    }
+    FLASHES = {
+        "ok":    [(0, 1, 0.12), (0, 0, 0.12)] * 3,      # 3 quick green flashes
+        "error": [(1, 0, 0.12), (0, 0, 0.12)] * 3,      # 3 quick red flashes
+    }
+
+    def __init__(self, red_pin, green_pin):
+        self.red, self.green = LED(red_pin), LED(green_pin)
+        self.mode, self._flash = "off", None
+        self._changed = threading.Event()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set(self, mode):
+        if mode != self.mode:
+            self.mode = mode
+            if self._flash is None:            # don't cut a flash short
+                self._changed.set()
+
+    def flash(self, kind):
+        self._flash = self.FLASHES[kind]
+        self._changed.set()
+
+    def _run(self):
+        while not self._stop:
+            flash = self._flash
+            steps = flash if flash is not None else self.MODES[self.mode]
+            self._changed.clear()
+            interrupted = False
+            for r, g, secs in steps:
+                self.red.value, self.green.value = r, g
+                if self._changed.wait(secs):   # something changed: start over
+                    interrupted = True
+                    break
+            if flash is not None and not interrupted and self._flash is flash:
+                self._flash = None             # flash done: back to the steady mode
+
+    def close(self):
+        self._stop = True
+        self._changed.set()
+        self._thread.join(timeout=2)
+        for led in (self.red, self.green):
+            led.off()
+            led.close()
 
 
 # ---------------- Clock ----------------
@@ -370,6 +437,7 @@ def cleanup():
     steps = [
         lambda: termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, RESOURCES["terminal"])
         if RESOURCES.get("terminal") else None,
+        lambda: RESOURCES["led"].close(),         # LED off = not running
         lambda: RESOURCES["buzzer"].off(),
         lambda: [b.close() for b in RESOURCES["buttons"]],
         lambda: RESOURCES["buzzer"].close(),
@@ -440,7 +508,8 @@ def main():
     buttons[COMPLETE].when_pressed = complete_pressed
     buttons[COMPLETE].when_held = complete_held
     buttons[COMPLETE].when_released = complete_released
-    RESOURCES.update(device=device, buzzer=buzzer, db=db, buttons=list(buttons.values()))
+    RESOURCES.update(device=device, buzzer=buzzer, db=db, buttons=list(buttons.values()),
+                     led=StatusLED(LED_RED, LED_GREEN))
 
     # "systemctl stop" and system shutdown send SIGTERM: exit through the normal cleanup.
     if threading.current_thread() is threading.main_thread():   # signals only work there
@@ -476,7 +545,8 @@ def main():
         """Powers the device off. Returns only if the shutdown command failed."""
         print("Shutting down")
         show(device, "Shutting down", "Unplug when the", "green LED stops")
-        beep(buzzer, "timeout")
+        RESOURCES["led"].set("halt")          # red steady; goes off when the script exits
+        beep(buzzer, "timeout", flash=False)
         device.persist = True                  # keep this message on screen after power-off
         try:
             r = subprocess.run(SHUTDOWN_CMD, capture_output=True, text=True, timeout=15)
@@ -617,6 +687,17 @@ def main():
         # Keep the idle screen current: date changes, clock syncing after boot, midnight.
         if pending is None and not message_until and now - idle["at"] >= IDLE_REFRESH:
             idle_screen(force=False)
+
+        # Status LED follows the current state.
+        if sending or shutdown_waiting or countdown is not None:
+            led_mode = "busy"
+        elif pending is not None:
+            led_mode = "waiting"
+        elif not clock_synced():
+            led_mode = "noclock"
+        else:
+            led_mode = "ready"
+        RESOURCES["led"].set(led_mode)
 
 
 if __name__ == "__main__":
