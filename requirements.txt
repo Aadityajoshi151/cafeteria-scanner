@@ -1,0 +1,17 @@
+# Python packages used by canteen.py.
+#
+# On a Raspberry Pi, install apt-packages.txt first, then create the venv with
+# --system-site-packages. pip then sees the apt-installed packages as already
+# satisfied and only downloads what apt doesn't provide (luma.oled).
+#
+#   sudo apt install -y $(grep -v '^#' apt-packages.txt)
+#   python3 -m venv --system-site-packages venv
+#   venv/bin/pip install -r requirements.txt
+
+pyserial        # RDM6300 card reader (serial port)
+gpiozero        # buttons and buzzer
+lgpio           # GPIO backend used by gpiozero
+openpyxl        # Excel export
+Pillow          # fonts and drawing for the display
+spidev          # SPI for the OLED
+luma.oled       # OLED driver (SSD1306)

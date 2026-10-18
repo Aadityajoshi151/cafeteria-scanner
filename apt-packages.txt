@@ -1,0 +1,13 @@
+# System packages for Raspberry Pi OS. Install with:
+#   sudo apt install -y $(grep -v '^#' apt-packages.txt)
+python3-serial
+python3-gpiozero
+python3-lgpio
+python3-rpi-lgpio
+python3-openpyxl
+python3-pil
+python3-spidev
+python3-venv
+fonts-dejavu-core
+git
+vim
