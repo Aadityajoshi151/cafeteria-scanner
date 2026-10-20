@@ -34,7 +34,7 @@ def service_active():
 
 def manual_run_active():
     """cafeteria.py started by hand in a terminal (not by the service)."""
-    r = run(["pgrep", "-f", "cafeteria.py"])
+    r = run(["pgrep", "-f", r"python[0-9.]* (-u )?\S*cafeteria\.py"])
     return r is not None and r.returncode == 0
 
 
